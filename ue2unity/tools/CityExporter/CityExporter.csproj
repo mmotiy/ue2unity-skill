@@ -13,6 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="oo2core_9_win64.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="oo2core_9_win64.dll" CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('oo2core_9_win64.dll')" />
   </ItemGroup>
 </Project>

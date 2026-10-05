@@ -20,8 +20,7 @@ UE5 存档。走 `ExtractFromBulkExports` 路径：查导出表里 class 为
 seg>1 时数据仍是 count×stride（通道 0）。
 
 ### `non-triangle polygons (VI=N, polys=M)`
-变角多边形（2 角退化面等）。需要旧格式的逐面角数解析，成本高收益低，
-通常直接记录放弃（市场包中占比 <1%）。
+不能仅凭实例/多边形数量推断变角或源损坏。检查多边形perimeter count、三角属性、实例映射和独立BulkData。确认当前格式缺可恢复拓扑时记录解析限制；未知对齐变体继续定位。
 
 ### `blob overrun` / `OverflowException` / 垃圾数值的 record shape
 记录对齐漂移。用 `--mdtest <file> <hexOffset>` 配合 hexdump 定位；
@@ -39,7 +38,7 @@ materials.json 里的槽位/参数映射是重建程序化逻辑的数据基础�
 ③ 确认没有误走"assembled 已找到"分支（见下）。
 
 ### `assembled mip payload N < expected M for PF_*`
-手里是低分辨率 mip。按 scale=1,2,4,8 降分辨率解码（N≈M/4 → 2048²）。
+先检查Source.bPNGCompressed。PNG声明路径不可猜低mip；必须读取真实bulk完整PNG并匹配Source尺寸。仅已证明raw有效mip路径允许按实际尺寸解码并报告。
 
 ### `legacy chunk short: N/M`
 .NET `ZLibStream.Read` 短读——必须循环 `while (got < need)` 读满。
@@ -48,7 +47,7 @@ materials.json 里的槽位/参数映射是重建程序化逻辑的数据基础�
 DLL 版本太老。必须 `oo2core_9_win64.dll`（v7 解不动 UE5.1 载荷）。
 
 ### PNG 内嵌但找不到
-`FindLargestPng` 的扫描起点用 `exp.SerialOffset`；跨多个 PNG 时取最大那个。
+检查真实Source bulk路径，不用固定最小payload门槛排除小PNG。FindLargestPng匹配Source尺寸和有界chunk/IEND，CRC另以完整PNG验证检查；最大PNG可能只是错误候选。见conversion-correctness。
 
 ## 材质绑定类
 
@@ -74,8 +73,8 @@ libarchive（tar.exe）的 RAR5 缺陷。改用 7-Zip（系统安装版或 PeaZi
 ## Unity 侧
 
 - glTF 导入：Package Manager → `com.unity.cloud.gltfast`
-- 法线凹凸相反 → 对应 `_N.png` 翻绿通道（大概率不需要）
-- `_M/_MR/_Mask` 类贴图必须线性空间（Editor 脚本已自动处理）
+- 法线受光异常 → 先查Source通道，再查shader读取XYZ还是UnityNormalMap/DXT5nm，不按引擎名直接翻绿。本例glTFast6.20 Built-in使用Default/linear。
+- 色彩空间按实际glTF绑定及显式meta角色；MASK_BASECOLOR是sRGB颜色图，普通mask/ORM为线性数据。
 - 拖 .gltf 进场景即可，材质已挂；prefab 从 Project 视图直接拖
 
 ## 补充（v7 实战）
@@ -85,5 +84,15 @@ libarchive（tar.exe）的 RAR5 缺陷。改用 7-Zip（系统安装版或 PeaZi
 交付前必检：遍历全部 glTF 验证 `max(indices) < POSITION count`。
 
 ### `non-triangle topology (VI=N, polys=M): no face connectivity in source`
-源文件无面连接数据（多边形元素全零 + 无三角形属性）。不可转换，记录放弃。
-判定特征：numVI != 3×numPolys 且多边形元素区全零。
+查看所有有效拓扑路径。上述特征说明本工具三连fallback不适用，当前源连接不可恢复时保留失败；不能扩大结论为所有解析路径或源UE渲染都失败。
+
+## v13 正确性问题
+
+- 各材质反复覆盖整模型：核对perimeterCount在前、groupID在后，并为每primitive分区indices；索引范围正确仍可能重复绘制。
+- 红蓝颠倒/金属度异常：真实Source PNG BGRA8恢复R/B与shader ORM通道解释是两层问题；本包ORM为R=AO/G=roughness/B=metallic，不能固定重排。
+- 叶片/栅栏/轮辐成为整面：追父链BlendMode和有效override，确认OpacityMask输入通道、UV与clip；本案例四灰度mask以R合成Alpha，MASK cutoff.3333/factorA1。
+- PNG被导成Cubemap：使用完整真实TextureImporter meta并指定Texture2D。
+- ImportPackage回调完成却没有资源：检查gzip FNAME。本次Unity6000.5中*.unitypackage内嵌名导致silent skip；禁用FNAME最小修复，tar布局无需猜改。
+- 更新后引用断开：保留现有sidecar GUID，meta不能作为资源被单独打包；新资源稳定UUID5。
+
+具体源字段、代码方法、控制实验及验证范围见 [conversion-correctness.md](conversion-correctness.md)。

@@ -1,111 +1,60 @@
 ---
 name: ue2unity
-description: 把 Unreal Engine 资产包（市场包/工程目录/.uasset/.umap）批量转换为 Unity 可用资源（glTF 2.0 + PNG + 材质绑定 + .unitypackage）。支持 UE4.25 内嵌格式与 UE5 虚拟化格式（StaticMeshDescriptionBulkData/FEditorBulkData/FCompressedBuffer/Oodle）、多 UV、多 mip 贴图变体。当用户要求把 UE 资源/资产/模型/贴图转成 Unity、导入 Unity、迁移 UE 工程到 Unity、或给出 .uasset/.umap/UE marketplace 包需要提取时使用——即使用户只说"转成 Unity"或"这个包 Unity 能用吗"也应触发。
+description: 将 Unreal Engine 未烹饪编辑器资产（Content目录、.uasset/.umap、市场资源包）转换为 Unity 的静态glTF、PNG和unitypackage。用于UE到Unity的资产提取、迁移、导入错误及材质失真诊断；不把Blueprint、粒子或复杂UE shader宣称为已完整迁移。
 ---
 
-# UE 资产 → Unity 转换技能
+# UE 编辑器资产 → Unity
 
-把一个 UE 资产目录（典型：Epic 商城包解压后的 `Content/<PackName>/`）批量转换为
-Unity 6 可直接导入的 **glTF 2.0 + PNG**，含材质槽→材质实例→贴图参数的完整绑定，
-并组装成 `Assets/` 目录与 `.unitypackage`。
+提供 CUE4Parse/.NET 导出器、Unity importer 和交付脚本。支持已实测的 UE4.25 内嵌及 UE5 虚拟化变体；其他包先抽样验证。遇到已有交付先核对版本、文件哈希和当前故障，不重复修复过时报告中的问题。
 
-实测：单个市场包（963 网格/524 贴图/混存 5 种存储格式）达到 98% 网格 + 96% 贴图覆盖。
+## 环境
 
-## 环境要求（Windows）
+- .NET10 SDK、Python3、Pillow；官方Khronos glTF Validator用于全量规范检查。
+- UE5 Oodle需要合法取得的 `oo2core_9_win64.dll`，自行置于 `tools/CityExporter/`；仓库不分发，不宣称自动下载。
+- RAR用7-Zip校验和解压。本案例Windows libarchive/RAR5解码曾出错，参考troubleshooting。
+- 隔离Unity项目安装官方 `com.unity.cloud.gltfast`。本次实测Unity6000.5.0f1、glTFast6.20.0、Built-in/D3D11；其他版本/管线需复验。
 
-| 依赖 | 获取方式 |
-|------|----------|
-| .NET 10 SDK | `dotnet --list-sdks` 检查；缺则 winget/dotnet.com 安装 |
-| **oo2core_9_win64.dll**（UE5 格式必需） | `curl -LO https://raw.githubusercontent.com/themixednuts/nw-tools/main/resources/oodle/oo2core_9_win64.dll`，放到 `tools/CityExporter/` 下。版本必须是 9（oo2core_7 解不动 UE5.1 载荷）。Epic 授权物，不入库 |
-| 7-Zip 引擎（RAR 用） | 系统 7z 或 PeaZip 便携版内置引擎：`res/bin/7z/7z.exe` |
-| Python + Pillow | 打 .unitypackage 用 |
+## 工作流
 
-## 工作流（严格按序）
+1. 校验归档并解压到有足够空间的独立目录，保留已有工程和交付。
+2. `dotnet build tools/CityExporter/CityExporter.csproj`；查 [formats.md](references/formats.md) 选择真实源路径，不按包名猜版本。
+3. 抽样覆盖旧格式、多材质UE5网格、法线/灰度/颜色图、透明和镂空材质；核对schema、索引、材质组和源像素。
+4. 全量导出到新目录：
 
-### 1. 归档验证与解压
-- 用 7z 先 `t` 校验再 `x` 解压。**禁用 libarchive（tar.exe）解 RAR5**——它的
-  RAR5 解码器有缺陷，会报"Truncated data in huffman tables"假错并产出半截文件。
-- 解压目标选剩余空间 ≥ 归档 2 倍的盘。
+   ```powershell
+   dotnet tools/CityExporter/bin/Debug/net10.0/CityExporter.dll --content SOURCE_CONTENT --out NEW_EXPORT --meshes --textures --materials
+   ```
 
-### 2. 构建导出器
-```
-cd tools/CityExporter
-cp <oo2core_9_win64.dll> .
-dotnet build
-```
+5. 按 [troubleshooting.md](references/troubleshooting.md) 定位失败。修代码后先针对根因回归，再全量检查；失败率低不能替代正确性，`VI != 3*polys`也不能单独证明源损坏。
+6. 组装到空候选目录，更新已有交付时保留旧GUID：
 
-### 3. 抽样验收（先小后大，勿直接全量）
-从解压目录抽 2-3 个网格 + 2-3 张贴图（含不同子目录）复制到临时目录，跑：
-```
-dotnet bin/Debug/net10.0/CityExporter.dll --content <样本目录> --out <out> --meshes --textures
-```
-检查：`[mesh]`/`[texture]` 行的数量、三角形数/顶点数 > 0、PNG 尺寸正确。
-抽出的 glTF 用 python json.load 验证合法、images URI 指向的文件存在。
+   ```powershell
+   python scripts/assemble_unity.py NEW_EXPORT NEW_DELIVERY --previous-assets OLD_DELIVERY/Assets/CityPacks
+   python scripts/pack_unitypackage.py NEW_DELIVERY/Assets/CityPacks NEW_DELIVERY/CityPacks_Unity6.unitypackage
+   ```
 
-### 4. 全量导出
-```
-dotnet bin/Debug/net10.0/CityExporter.dll --content <Content/PackName> --out <out> --meshes --textures --materials
-```
-产出：`out/Meshes/**/*.gltf(+.bin)`、`out/Textures/**/*.png`、`out/materials.json`、
-`out/export_errors.log`。
+   首次交付省略 `--previous-assets`。bash入口转发到Python。
+7. 全量检查官方schema、accessor/count/minmax、索引范围、finite/unitnormal、URI、材质三角形分区、PNG CRC/Source尺寸及像素合同；冻结哈希。负dot区分全角反向、混合平滑、近零和退化，不整批翻面。
+8. 隔离Unity实际导入代表模型，核对Texture2D、shader、语义色彩空间、GPU法线、透明/镂空和原材质截图。使用实际成品包的原GUID/asset/meta抽样，等待ImportPackage落地、AssetDatabase加载和编译完成；不能只看回调或exit0。
+9. 整包对照磁盘asset/meta/path/GUID，读完gzip校验CRC；备份旧交付后替换。报告区分全量文件检查与Unity抽样，并列出未转换项和shader近似。
 
-### 5. 分析失败清单并迭代
-读 `export_errors.log`，按 `references/troubleshooting.md` 对照修复（该文件收录了
-本项目踩过的全部坑及修法）。修复后只对失败子集回归，再全量重跑。
-失败率 < 2% 或剩余为退化几何时停止迭代。
+## 易错合同
 
-### 6. 组装 Unity 交付
-```
-bash scripts/assemble_unity.sh <导出目录> <输出目录>
-```
-产出 `Assets/CityPacks/{Meshes,Textures,Editor}` + `CityPacks_Unity6.unitypackage` +
-`Report/{materials.json,export_errors.log}`。使用说明模板在 `unity/README_Unity6.template.md`。
+- 本案例旧多边形记录为 `{empty perimeter count=0, PolygonGroupID}`，组号在第二int。Position按顶点，UV/Normal按实例，索引引用实例，需viToVertex展开。
+- 每材质primitive只用自己的三角形，不能重复整网格indices；glTF scene为整数，images为对象数组。
+- 真实BGRA8 Source PNG在源读取边界恢复R/B、保留G/A；raw解码和G8不重复换色。声明PNG时匹配Source尺寸和完整载荷，不猜低mip。
+- ORM从实际shader图解释。本案例R=AO/G=roughness/B=metallic，MR是字节相同别名，不能对所有UE `_M` 固定重排。
+- 材质沿父链继承；override字段存在不代表启用。Masked追实际OpacityMask通道、UV、阈值、双面，未知图显式报错。
+- 本案例glTFast读RGB XYZ法线，使用Default/linear；UnityNormalMap的DXT5nm重打包不匹配。颜色、法线、数据图以meta的 `CityPacksColor/CityPacksNormalXYZ/CityPacksLinearData` 为准，不能仅凭MASK文件名设置线性。
+- Python gzip禁用可选FNAME，避免Unity6000.5静默跳过内嵌名为unitypackage的载荷；保留sidecar/GUID，不将meta作为独立资源打包。
 
-### 7. 最终验证（必做）
-- 随机抽 ≥60 个 glTF：JSON 合法、images 的相对 URI 全部存在（0 断链）、
-  材质绑定率抽样统计
-- 抽 1 个网格核对包围盒数值是否符合物体常识（如桶 ≈ ±30cm×100cm）
-- `.unitypackage` 用 tar -tzf 验证结构（每文件 asset/asset.meta/pathname 三件套）
+## 按需资源
 
-## 输出契约（给用户交付时）
+- [formats.md](references/formats.md)：字节布局与变体。
+- [troubleshooting.md](references/troubleshooting.md)：错误与定位步骤。
+- [conversion-correctness.md](references/conversion-correctness.md)：v13根因、源合同、代码位置及实测证据；修材质/颜色/法线/包时读取。
+- `scripts/check_export.py`：可重复二进制/结构检查，不替代官方validator或GPU验收。
+- `scripts/test_source_png.py`：无商业素材的源PNG通道/尺寸/完整性回归。
+- `scripts/test_delivery.py`：组装语义metadata、GUID、gzip和sidecar回归。
 
-| 项 | 内容 |
-|----|------|
-| `Assets/<Pack>/` | Meshes（glTF+bin，Y-up/米制根节点变换已内建）、Textures、Editor/TextureImportPostprocessor.cs |
-| `.unitypackage` | 一键导入包 |
-| Report | materials.json（全量槽位→材质→贴图映射）+ export_errors.log |
-| README | 安装步骤（glTFast 包）+ 覆盖率表 + 缺口补齐路径 |
-
-## 关键技术事实（为什么这样做）
-
-1. **一个市场包可能混存多个引擎版本的存档格式**（如 "4.25-5.0" 包里 UE4.25 与
-   UE5 存档各半）。必须双路径都支持，不能按包名猜单一版本。
-2. 未烹饪 .uasset 的网格几何**不在渲染数据里**（uncooked 不序列化 RenderData），
-   在 SourceModel 的 MeshDescription 或（UE5）独立的 BulkData 导出对象里。
-3. UE5 虚拟化链路：`UStaticMeshDescriptionBulkData` 导出（88 字节
-   `FEditorBulkData` 头）→ `FCompressedBuffer`（大端，Oodle 压缩）→
-   UE5 名字键控 MeshDescription。详见 `references/formats.md`。
-4. 法线/金属度约定：UE 与 glTF 同为 OpenGL 约定，直接绑定即可；UE 打包图
-   `_M` 为 R=金属 G=粗糙 B=AO，需重排为 glTF 的 G=粗糙 B=金属（工具已内建
-   `_MR.png` 生成）。个别资产凹凸视觉相反时在 Unity 侧翻绿通道。
-5. glTF 根节点带 `-90° X 旋转 + 0.01 缩放`，UE Z-up/厘米 → glTF Y-up/米，
-   Unity glTFast 导入即正确，无需手工调。
-
-## 工具清单
-
-| 文件 | 用途 |
-|------|------|
-| `tools/CityExporter/` | C# 导出器（CUE4Parse + 自研 UE5 格式解析 + Oodle P/Invoke） |
-| `scripts/assemble_unity.sh` | 组装 Assets 目录 + .unitypackage |
-| `scripts/pack_unitypackage.py` | .unitypackage 打包器（纯 python/tar） |
-| `scripts/monitor_transfer.sh` | 下载完成监控（改名事件 + 大小冻结 + CRC 校验） |
-| `unity/TextureImportPostprocessor.cs` | Unity 自动导入配置（法线/线性空间） |
-| `unity/README_Unity6.template.md` | 交付说明模板 |
-
-CityExporter 调试模式：`--dump <uasset>` 打印导出表/属性、`--mdtest <file> <hexOff>`
-试解析 MeshDescription——逆向新格式时的主力工具。
-
-## 参考文档（按需读取）
-
-- 遇到导出失败/新格式变体 → 读 `references/troubleshooting.md`
-- 需要字节级格式细节（头布局、魔数、通道表） → 读 `references/formats.md`
+本案例v13为946模型、569PNG（505源+60ORM+4MASK），全946官方error0，18模型实际Unity验收通过；仍有8解析失败、65混合法线诊断，基础贴图槽覆盖2002/2298。这些案例数字不是其他包的预期值。

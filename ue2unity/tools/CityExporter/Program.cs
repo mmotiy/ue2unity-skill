@@ -1,4 +1,4 @@
-// CityExporter v2 — batch-exports Unreal Engine UNCOOKED EDITOR PACKAGES
+// CityExporter repair 20261005 — exports Unreal Engine UNCOOKED EDITOR PACKAGES
 // (.uasset, no .pak) from a marketplace-style Content tree to glTF 2.0 (static
 // meshes) and PNG (textures) for later import into Unity 6 (glTFast).
 //
@@ -13,8 +13,9 @@
 // and scale 0.01 converts cm -> m. The Unity side therefore needs no manual
 // conversion; the raw buffers remain untouched UE data.
 //
-// NORMAL MAPS: UE normals are DirectX-style (-Y). They are bound as-is; the
-// convention flip is handled on the Unity side (documented, not applied here).
+// NORMAL MAPS: Source PNG channel order is restored at the texture boundary.
+// glTFast 6.20 Built-in consumes raw RGB XYZ; import those PNGs as Default,
+// linear data. Do not infer a green-channel flip from the engine name alone.
 //
 // HOW MESH EXTRACTION WORKS
 // =========================
@@ -30,7 +31,7 @@
 // serialized edge list), per-poly group ids, and named attribute records
 // ("Position", "TextureCoordinate", "Normal", "ImportedMaterialSlotName", ...).
 //
-// HOW MATERIAL BINDING WORKS (v2)
+// HOW MATERIAL BINDING WORKS
 // ===============================
 // Mesh StaticMaterials entries carry MaterialInterface (an import of a
 // UMaterialInstanceConstant package, resolved to a /Game/... path),
@@ -40,7 +41,7 @@
 // the parameter name inside ParameterInfo.Name (this UE version) or a flat
 // ParameterName. Texture params whose target PNG exists in the exported
 // Textures tree are bound into the glTF (baseColor / normal / emissive /
-// metallicRoughness + occlusion via a channel-swizzled _MR copy); see
+// metallicRoughness + occlusion via an identity ORM _MR copy); see
 // MatchCategory for the recognized parameter names.
 
 using System.Buffers.Binary;
@@ -71,9 +72,21 @@ using SkiaSharp;
 string content = "";
 string outDir = "";
 bool doMeshes = false, doTextures = false, doMaterials = false, doDump = false;
+var meshFilter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+var textureFilter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
 // --dump <file.uasset>: debug — print package summary / export map / properties
 // --mdtest <file> <hexOffset>: run ParseMeshDescription on file[offset..EOF]
+if (args.Length == 5 && args[0] == "--source-png-select") {
+  var selected = FindLargestPng(File.ReadAllBytes(args[1]), 0, int.Parse(args[2]), int.Parse(args[3]));
+  if (selected == null) return 2;
+  File.WriteAllBytes(args[4], selected.Value.png);
+  return 0;
+}
+if (args.Length == 4 && args[0] == "--source-png-test") {
+  File.WriteAllBytes(args[3], RestoreSourcePng(File.ReadAllBytes(args[1]), args[2], "regression", "test"));
+  return 0;
+}
 if (args.Length >= 3 && args[0] == "--mdtest")
 {
     var path = args[1];
@@ -95,6 +108,45 @@ if (args.Length >= 3 && args[0] == "--mdtest")
 
 if (args.Length >= 2 && args[0] == "--dump")
 {
+    void PrintNested(object? value, string prefix, int depth = 0) {
+      if (depth > 4) {
+        return;
+      }
+      if (value is FScriptStruct scriptStruct) {
+        value = scriptStruct.StructType;
+      }
+      if (value is FLinearColor color) {
+        Console.WriteLine($"{prefix}rawType={value.GetType().FullName}; parsedRgba={color.R:R},{color.G:R},{color.B:R},{color.A:R}");
+      } else if (value is FStructFallback fallback) {
+        foreach (var property in fallback.Properties) {
+          var child = property.Tag?.GenericValue;
+          Console.WriteLine($"{prefix}{property.Name.Text} = {child}");
+          PrintNested(child, prefix + "    ", depth + 1);
+        }
+      } else if (value is UScriptArray array) {
+        foreach (var element in array.Properties) {
+          PrintNested(element.GenericValue, prefix + "    ", depth + 1);
+        }
+      }
+    }
+    void PrintInput(object? value, string prefix) {
+      if (value is FScriptStruct scriptStruct) {
+        value = scriptStruct.StructType;
+      }
+      if (value == null) {
+        return;
+      }
+      var type = value.GetType();
+      if (!type.Name.StartsWith("FMaterialInput") && type.Name != "FExpressionInput") {
+        return;
+      }
+      foreach (var field in type.GetFields()) {
+        Console.WriteLine($"{prefix}{field.Name} = {field.GetValue(value)}");
+      }
+      foreach (var property in type.GetProperties().Where(p => p.GetIndexParameters().Length == 0)) {
+        Console.WriteLine($"{prefix}{property.Name} = {property.GetValue(value)}");
+      }
+    }
     var dumpPath = Path.GetFullPath(args[1]);
     var dumpDir = Path.GetDirectoryName(dumpPath)!;
     var dumpVersions = new VersionContainer(EGame.GAME_UE5_0);
@@ -155,11 +207,13 @@ if (args.Length >= 2 && args[0] == "--dump")
                 if (v is UScriptArray arr)
                 {
                     Console.WriteLine($"    {prop.Name.Text}: array[{arr.Properties.Count}]");
-                    foreach (var el in arr.Properties.Take(6))
+                    foreach (var el in arr.Properties)
                     {
                         if (el.GenericValue is FScriptStruct fss && fss.StructType is FStructFallback fb)
-                            foreach (var fp in fb.Properties)
+                            foreach (var fp in fb.Properties) {
                                 Console.WriteLine($"        . {fp.Name.Text} = {fp.Tag?.GenericValue}");
+                                PrintNested(fp.Tag?.GenericValue, "            ");
+                            }
                         else
                             Console.WriteLine($"        . {el.GenericValue} ({el.GenericValue?.GetType().Name})");
                     }
@@ -167,11 +221,17 @@ if (args.Length >= 2 && args[0] == "--dump")
                 else if (v is FStructFallback sfb)
                 {
                     Console.WriteLine($"    {prop.Name.Text}: struct");
-                    foreach (var fp in sfb.Properties)
+                    foreach (var fp in sfb.Properties) {
                         Console.WriteLine($"        . {fp.Name.Text} = {fp.Tag?.GenericValue}");
+                        PrintNested(fp.Tag?.GenericValue, "            ");
+                    }
                 }
                 else
+                {
                     Console.WriteLine($"    {prop.Name.Text} = {v}");
+                    PrintInput(v, "        ");
+                    PrintNested(v, "        ");
+                }
             }
             if (uo.Properties.Count == 0) Console.WriteLine("    <no properties loaded>");
         }
@@ -188,6 +248,8 @@ for (int i = 0; i < args.Length; i++)
         case "--meshes": doMeshes = true; break;
         case "--textures": doTextures = true; break;
         case "--materials": doMaterials = true; break;
+        case "--mesh": meshFilter.Add(args[++i]); break;
+        case "--texture-name": textureFilter.Add(args[++i]); break;
         case "-h" or "--help":
             Console.WriteLine("Usage: CityExporter --content <dir> --out <dir> [--meshes] [--textures] [--materials]");
             return 0;
@@ -217,6 +279,97 @@ Console.WriteLine($"Found {uassetFiles.Length} .uasset files under {content}");
 var miCache = new Dictionary<string, MaterialParams>(StringComparer.OrdinalIgnoreCase); // /Game/ pkg path -> params
 var meshSlotInfos = new List<(string MeshName, string PkgPath, List<SlotInfo> Slots)>();
 
+MaterialParams LoadMaterialParams(string key) {
+  if (miCache.TryGetValue(key, out var cached)) {
+    return cached;
+  }
+  var result = new MaterialParams { Path = key, Name = Path.GetFileName(key) };
+  miCache[key] = result;
+  string relGame = (key.StartsWith("/Game/") ? key[6..] : key) + ".uasset";
+  var materialFile = provider.Files.Values.FirstOrDefault(
+      f => f.Path.Replace('\\', '/').EndsWith(relGame, StringComparison.OrdinalIgnoreCase));
+  if (materialFile == null || !provider.TryLoadPackage(materialFile, out var package) ||
+      package == null) {
+    return result;
+  }
+  var material = package.ExportsLazy.Select(e => e.Value)
+      .FirstOrDefault(e => e is UMaterialInstanceConstant || e is UMaterial);
+  if (material is UMaterialInstanceConstant instance) {
+    result = ParseMiParams(instance, key);
+    miCache[key] = result;
+    if (result.ParentPath != null) {
+      var parent = LoadMaterialParams(result.ParentPath);
+      result.BlendMode = parent.BlendMode;
+      result.DoubleSided = parent.DoubleSided;
+      result.UnconnectedMetallicDefault = parent.UnconnectedMetallicDefault;
+      result.MaskTextureParameter = parent.MaskTextureParameter;
+      result.OpacityMaskClipValue = parent.OpacityMaskClipValue;
+      foreach (var (name, value) in parent.Scalars) {
+        result.Scalars.TryAdd(name, value);
+      }
+      foreach (var (name, value) in parent.Vectors) {
+        result.Vectors.TryAdd(name, value);
+      }
+      foreach (var (name, value) in parent.Textures) {
+        result.Textures.TryAdd(name, value);
+      }
+    }
+    var overrides = instance.GetOrDefault<FStructFallback?>("BasePropertyOverrides", null);
+    if (overrides?.GetOrDefault<bool>("bOverride_BlendMode", false) == true) {
+      result.BlendMode = overrides.Properties.FirstOrDefault(p => p.Name.Text == "BlendMode")
+          ?.Tag?.GenericValue?.ToString() ?? "BLEND_Opaque";
+    }
+    if (overrides?.GetOrDefault<bool>("bOverride_TwoSided", false) == true) {
+      result.DoubleSided = overrides.GetOrDefault<bool>("TwoSided", false);
+    }
+    if (overrides?.GetOrDefault<bool>("bOverride_OpacityMaskClipValue", false) == true) {
+      result.OpacityMaskClipValue = overrides.GetOrDefault<float>("OpacityMaskClipValue", 0.333333f);
+    }
+  } else if (material is UMaterial master) {
+    result.BlendMode = master.Properties.FirstOrDefault(p => p.Name.Text == "BlendMode")
+        ?.Tag?.GenericValue?.ToString() ?? "BLEND_Opaque";
+    result.DoubleSided = master.GetOrDefault<bool>("TwoSided", false);
+    result.OpacityMaskClipValue = master.GetOrDefault<float>("OpacityMaskClipValue", 0.3333f);
+    // These source graphs were independently traced to direct grayscale RGB
+    // samples at UV0. BaseMaterial uses MakeMaterialAttributes; the other two
+    // use the root OpacityMask input. No base-color/vector alpha enters them.
+    if (key.EndsWith("/M_Leaves", StringComparison.Ordinal) ||
+        key.EndsWith("/M_BaseMaterial", StringComparison.Ordinal)) {
+      result.MaskTextureParameter = "maskopacity";
+    } else if (key.EndsWith("/M_DecalRoad", StringComparison.Ordinal)) {
+      result.MaskTextureParameter = "opacity";
+    }
+    // Independently traced source profile: Wet has direct material inputs and
+    // no Metallic input at all. Its UE default is zero; the ORMH blue channel
+    // must not turn this nonmetal material into glTF's default metallic=1.
+    if (key.EndsWith("/M_BaseMaterialWet", StringComparison.Ordinal) &&
+        !master.GetOrDefault<bool>("bUseMaterialAttributes", false) &&
+        !master.Properties.Any(p => p.Name.Text == "Metallic")) {
+      result.UnconnectedMetallicDefault = 0;
+    }
+    foreach (var expression in package.ExportsLazy.Select(e => e.Value)) {
+      string parameterName = expression.GetOrDefault<FName>("ParameterName", new FName("")).Text;
+      if (parameterName.Length == 0) {
+        continue;
+      }
+      // M_Leaves is also directly referenced by eight meshes. Preserve its
+      // actual texture defaults, and let each instance override them by name.
+      if (key.EndsWith("/M_Leaves", StringComparison.Ordinal) &&
+          expression.GetType().Name == "UMaterialExpressionTextureSampleParameter2D") {
+        var texturePath = expression.GetOrDefault<FPackageIndex?>("Texture", null)
+            ?.ResolvedObject?.GetPathName();
+        if (texturePath != null && texturePath.Contains('.')) {
+          result.Textures[parameterName] = texturePath[..texturePath.LastIndexOf('.')];
+        }
+      }
+      if (expression.GetType().Name == "UMaterialExpressionScalarParameter") {
+        result.Scalars[parameterName] = expression.GetOrDefault<float>("DefaultValue", 0);
+      }
+    }
+  }
+  return result;
+}
+
 string MountPrefix() => uassetFiles.Length > 0
     ? uassetFiles[0].Path[..uassetFiles[0].Path.IndexOf('/')]
     : Path.GetFileName(content.TrimEnd('\\', '/'));
@@ -224,13 +377,16 @@ string MountPrefix() => uassetFiles.Length > 0
 string mount = MountPrefix();
 
 // ---- pass 1: textures (so the Textures tree is complete before any glTF
-//      binding resolves image URIs / writes swizzled _MR copies) ----
+//      binding resolves image URIs / writes identity ORM _MR aliases) ----
 if (doTextures)
 {
     foreach (var file in uassetFiles)
     {
         try
         {
+            if (textureFilter.Count > 0 && !textureFilter.Contains(Path.GetFileNameWithoutExtension(file.Path))) {
+                continue;
+            }
             if (!provider.TryLoadPackage(file, out var package) || package == null) throw new Exception("TryLoadPackage failed");
             var tex = package.ExportsLazy.Select(l => l.Value).OfType<UTexture2D>().FirstOrDefault();
             if (tex == null) continue;
@@ -260,6 +416,9 @@ if (doMeshes || doMaterials)
     {
         try
         {
+            if (meshFilter.Count > 0 && !meshFilter.Contains(Path.GetFileNameWithoutExtension(file.Path))) {
+                continue;
+            }
             if (!provider.TryLoadPackage(file, out var package) || package == null) continue;
             var mesh = package.ExportsLazy.Select(l => l.Value).OfType<UStaticMesh>().FirstOrDefault();
             if (mesh == null) continue;
@@ -280,26 +439,7 @@ if (doMeshes || doMaterials)
                 if (s.MaterialPath != null)
                 {
                     var key = s.MaterialPath.SubstringBefore2('.');
-                    if (!miCache.TryGetValue(key, out mp))
-                    {
-                        mp = null;
-                        var relGame = (key.StartsWith("/Game/") ? key[6..] : key).Replace('\\', '/') + ".uasset";
-                        var gf = provider.Files.Values
-                            .FirstOrDefault(f => f.Path.Replace('\\', '/').EndsWith(relGame, StringComparison.OrdinalIgnoreCase));
-                        if (gf != null && provider.TryLoadPackage(gf, out var mpkg) && mpkg != null)
-                        {
-                            foreach (var lz in mpkg.ExportsLazy)
-                            {
-                                if (lz.Value is UMaterialInstanceConstant mic)
-                                {
-                                    mp = ParseMiParams(mic, key);
-                                    break;
-                                }
-                            }
-                        }
-                        miCache[key] = mp ?? new MaterialParams { Path = key, Name = key.After2('/') };
-                    }
-                    else mp = miCache[key];
+                    mp = LoadMaterialParams(key);
                 }
                 slotParams.Add(mp);
             }
@@ -307,7 +447,8 @@ if (doMeshes || doMaterials)
 
             if (!doMeshes) continue;
 
-            var (positions, uvs, normals, indices, slotNames, cornerSlots) = ExtractStaticMesh(package, mesh, file, versions);
+            string? descriptionPath = meshFilter.Count > 0 ? Path.Combine(outDir, "Debug", mesh.Name + ".meshdescription") : null;
+            var (positions, uvs, normals, indices, slotNames, cornerSlots) = ExtractStaticMesh(package, mesh, file, versions, descriptionPath);
             var gltfPath = Path.Combine(outDir, "Meshes", baseName.Replace('/', Path.DirectorySeparatorChar) + ".gltf");
             var bindings = slots
                 .Select((s, i) => ResolveBinding(slotParams[i], outDir, Path.GetDirectoryName(gltfPath)!))
@@ -344,7 +485,7 @@ if (doMaterials)
                 if (lazy.Value is not UMaterialInstanceConstant mic) continue;
                 var key = "/Game/" + (rel.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) ? rel[..^7] : rel);
                 if (!miCache.ContainsKey(key))
-                    miCache[key] = ParseMiParams(mic, key);
+                    LoadMaterialParams(key);
             }
         }
         catch (Exception ex)
@@ -375,7 +516,7 @@ return 0;
 // ---------------------------------------------------------------------------
 
 static (float[] pos, float[] uv, float[] nrm, uint[] idx, string[] slots, int[] cornerSlots)
-    ExtractStaticMesh(CUE4Parse.UE4.Assets.IPackage package, UStaticMesh mesh, GameFile file, VersionContainer versions)
+    ExtractStaticMesh(CUE4Parse.UE4.Assets.IPackage package, UStaticMesh mesh, GameFile file, VersionContainer versions, string? descriptionPath = null)
 {
     if (package is not CUE4Parse.UE4.Assets.Package pkg)
         throw new Exception("package is not a CUE4Parse.UE4.Assets.Package");
@@ -451,6 +592,10 @@ static (float[] pos, float[] uv, float[] nrm, uint[] idx, string[] slots, int[] 
         // current CUE4Parse; it only affects SourceModels after the first, which we skip.
 
         var desc = bulk.Data ?? throw new Exception("FMeshDescription bulk payload is null");
+        if (descriptionPath != null) {
+          Directory.CreateDirectory(Path.GetDirectoryName(descriptionPath)!);
+          File.WriteAllBytes(descriptionPath, desc);
+        }
         return ParseMeshDescription(desc, mesh, versions);
     }
 
@@ -729,27 +874,42 @@ static (float[] pos, float[] uv, float[] nrm, uint[] idx, string[] slots, int[] 
     }
     var idx = new uint[nTri * 3];
     var cornerSlots = new int[nTri * 3];
-    var groupIds = new List<int>();
+    var propSlots = GetMeshSlots(mesh);
+    var groupNames = new List<string>();
+    var groupContainer = C("PolygonGroups");
+    var nameAttribute = groupContainer == null ? null : A(groupContainer, "ImportedMaterialSlotName");
+    if (nameAttribute?.Channels.Count > 0) {
+      var namesReader = new BlobReader(nameAttribute.Channels[0]);
+      while (!namesReader.AtEnd) {
+        int length = namesReader.I32();
+        groupNames.Add(Encoding.UTF8.GetString(namesReader.Bytes(length)).TrimEnd('\0'));
+      }
+    }
     for (int t = 0; t < nTri; t++)
     {
         int g = tGroup[t];
-        if (!groupIds.Contains(g)) groupIds.Add(g);
+        int slot = g;
+        if (g >= 0 && g < groupNames.Count && groupNames[g].Length > 0) {
+          int namedSlot = propSlots.FindIndex(s => s.ImportedName == groupNames[g] ||
+              s.SlotName == groupNames[g]);
+          if (namedSlot >= 0) {
+            slot = namedSlot;
+          }
+        }
+        if (slot < 0 || slot >= Math.Max(1, propSlots.Count)) {
+          throw new Exception($"polygon group {g} has no source material slot");
+        }
         for (int k = 0; k < 3; k++)
         {
             int inst = tInst[t * 3 + k];
             if (inst < 0 || inst >= nInst) throw new Exception($"bad instance index {inst} at tri {t}");
             idx[t * 3 + k] = (uint)inst;
-            cornerSlots[t * 3 + k] = groupIds.IndexOf(g);
+            cornerSlots[t * 3 + k] = slot;
         }
     }
-    // slot names: map group index to StaticMaterials slot names where counts line up
-    string[] slots;
-    var propSlots = GetMeshSlots(mesh);
-    var groupNames = new List<string>();
-    for (int i = 0; i < groupIds.Count; i++)
-        groupNames.Add(propSlots.Count == groupIds.Count ? propSlots[i].SlotName : $"Slot{groupIds[i]}");
-    slots = groupNames.ToArray();
-    Console.Error.WriteLine($"[ue5md] assembled: {vCont.NumElements} verts, {nInst} instances, {nTri} tris, {groupIds.Count} groups");
+    string[] slots = propSlots.Count > 0 ? propSlots.Select(s => s.SlotName).ToArray() :
+        new[] { "Material" };
+    Console.Error.WriteLine($"[ue5md] assembled: {vCont.NumElements} verts, {nInst} instances, {nTri} tris, {slots.Length} slots");
     return (pos, uv, nrm, idx, slots, cornerSlots);
 }
 
@@ -969,13 +1129,15 @@ static (float[] pos, float[] uv, float[] nrm, uint[] idx, string[] slots, int[] 
 
     int numPolys = NumElements();
     var polyGroup = new int[numPolys];
-    // dump-verified on this pack: each polygon element is exactly 2 ints
-    // { PolygonGroupID, 0 } — perimeters are NOT serialized (the 4 meshes that
-    // would need them carry no face connectivity at all, see error class below)
+    // Verified against the eight-group door sample: the empty legacy perimeter
+    // array count precedes PolygonGroupID. Reading the first int loses all slots.
     for (int p = 0; p < numPolys; p++)
     {
+        int perimeterCount = r.I32();
+        if (perimeterCount != 0) {
+          throw new Exception($"unsupported legacy perimeter count {perimeterCount}");
+        }
         polyGroup[p] = r.I32();
-        r.I32();
     }
 
     int numGroups = NumElements();
@@ -1194,6 +1356,9 @@ static MaterialParams ParseMiParams(UMaterialInstanceConstant mic, string path)
                     if (it.GenericValue is not FScriptStruct fss || fss.StructType is not FStructFallback fb) continue;
                     var name = ParamName(fb);
                     var gv = fb.Properties.FirstOrDefault(x => x.Name.Text == "ParameterValue")?.Tag?.GenericValue;
+                    if (gv is FScriptStruct vectorStruct) {
+                      gv = vectorStruct.StructType;
+                    }
                     if (name.Length > 0 && gv is FLinearColor lc)
                         mp.Vectors[name] = new[] { lc.R, lc.G, lc.B, lc.A };
                 }
@@ -1249,6 +1414,7 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
     long srcStart = -1; int srcLen = 0;
     int srcW = 0, srcH = 0;
     string srcFormatName = "";
+    bool srcPngCompressed = false;
     while (true)
     {
         var tag = new FPropertyTag(ar, false);
@@ -1276,8 +1442,12 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
             var t = new FPropertyTag(sAr, false);
             if (t.Name.IsNone) break;
             long ds = sAr.Position;
+            Console.Error.WriteLine($"[texture-source] {tex.Name}: tag={t.Name.Text}, type={t.PropertyType.Text}, size={t.Size}, raw={BitConverter.ToString(rawBytes, (int)ds, (int)Math.Min(t.Size, 16))}");
             switch (t.Name.Text)
             {
+                case "bPNGCompressed":
+                    srcPngCompressed = t.TagData?.Bool == true;
+                    break;
                 case "SizeX" when t.Size == 4:
                     srcW = BinaryPrimitives.ReadInt32LittleEndian(rawBytes.AsSpan((int)ds));
                     break;
@@ -1295,6 +1465,7 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
             p = ds + t.Size;
         }
     }
+    Console.Error.WriteLine($"[texture-source-format] {tex.Name}: resolved={srcFormatName}, dimensions={srcW}x{srcH}, pngCompressed={srcPngCompressed}");
     if (srcW <= 0 || srcH <= 0) throw new Exception($"bad Source dimensions {srcW}x{srcH}");
 
     // ---- locate mip payloads in the file tail (after property list + guid) ----
@@ -1302,9 +1473,12 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
     long tailStart = ar.Position;
 
     // PNG fast path: editor textures with bPNGCompressed store whole PNGs inline
-    var pngStream = FindLargestPng(rawBytes, (int)exp.SerialOffset, srcW, srcH);
-    if (pngStream != null)
-        return pngStream.Value;
+    var pngStream = srcPngCompressed
+        ? FindLargestPng(rawBytes, (int)exp.SerialOffset, srcW, srcH) : null;
+    if (pngStream != null) {
+        Console.Error.WriteLine($"[texture-png-fast] {tex.Name}: format={srcFormatName}, size={pngStream.Value.w}x{pngStream.Value.h}, bytes={pngStream.Value.png.Length}");
+        return (RestoreSourcePng(pngStream.Value.png, srcFormatName, tex.Name, "inline"), pngStream.Value.w, pngStream.Value.h);
+    }
 
     // raw path: scan for the FByteBulkData header (CUE4Parse natively decodes
     // UE's chunked zlib format once the header is located). The header may sit
@@ -1320,10 +1494,18 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
             probe.Position = pos;
             var bulk = new FByteBulkData(probe);
             var hd = bulk.Header;
-            if (hd.ElementCount is < (1 << 19) or > (1 << 29)) continue;
+            if (hd.ElementCount is < 64 or > (1 << 29)) continue;
             if (hd.SizeOnDisk < hd.ElementCount / 16 || hd.SizeOnDisk > hd.ElementCount * 1.2) continue;
             var data = bulk.Data;
             if (data == null || data.Length != hd.ElementCount) continue;
+            if (srcPngCompressed) {
+                // A compressed source can be much smaller than 512 KiB. Reject
+                // unrelated bulk candidates instead of inferring a raw format.
+                var sourcePng = FindLargestPng(data, 0, srcW, srcH);
+                if (sourcePng == null) continue;
+                Console.Error.WriteLine($"[texture-source-bulk] {tex.Name}: header=0x{pos:X}, bytes={data.Length}, sourcePNG={sourcePng.Value.w}x{sourcePng.Value.h}");
+                return (RestoreSourcePng(sourcePng.Value.png, srcFormatName, tex.Name, "source-bulk"), sourcePng.Value.w, sourcePng.Value.h);
+            }
             assembled = data;
             break;
         }
@@ -1348,7 +1530,8 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
                     if (legacy == null || legacy.Length < 64) continue;
                     Console.Error.WriteLine($"[tex-ue5] legacy payload decoded: {legacy.Length} bytes from 0x{p:X}, head={BitConverter.ToString(legacy, 0, 8)}");
                     var pngL = FindLargestPng(legacy, 0, srcW, srcH);
-                    if (pngL != null) return pngL.Value;
+                    if (pngL != null) return (RestoreSourcePng(pngL.Value.png, srcFormatName, tex.Name, "legacy"), pngL.Value.w, pngL.Value.h);
+                    if (srcPngCompressed) continue;
                     var fmtL = InferPixelFormat(srcW, srcH, legacy.Length, srcFormatName);
                     var fiL = PixelFormatUtils.PixelFormats.TryGetValue(fmtL, out var fL)
                         ? fL : throw new Exception($"pixel format {fmtL} has no format info");
@@ -1364,7 +1547,7 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
                         tex.PlatformData.Mips = new FTexture2DMipMap[] { new(new FByteArrayData(mipL), srcW, srcH, 1) };
                         var decL = tex.Decode();
                         if (decL != null)
-                            return (decL.Encode(ETextureFormat.Png, false, out _), decL.Width, decL.Height);
+                            return (EncodeTextureDebug(decL, tex.Name, "legacy", fmtL, srcFormatName), decL.Width, decL.Height);
                     }
                 }
                 catch (Exception ex)
@@ -1400,7 +1583,8 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
                 Console.Error.WriteLine($"[tex-ue5] blob head: {head}");
                 // PNG fast path inside the decoded source payload
                 var png2 = FindLargestPng(blob, 0, srcW, srcH);
-                if (png2 != null) return png2.Value;
+                if (png2 != null) return (RestoreSourcePng(png2.Value.png, srcFormatName, tex.Name, "virtualized"), png2.Value.w, png2.Value.h);
+                if (srcPngCompressed) continue;
                 // raw mip data
                 var fmt2 = InferPixelFormat(srcW, srcH, blob.Length, srcFormatName);
                 var fi2 = PixelFormatUtils.PixelFormats.TryGetValue(fmt2, out var f2)
@@ -1416,7 +1600,7 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
                 tex.PlatformData.Mips = new FTexture2DMipMap[] { new(new FByteArrayData(mip2), srcW, srcH, 1) };
                 var dec2 = tex.Decode();
                 if (dec2 == null) throw new Exception("texture decode returned null");
-                var pngOut = dec2.Encode(ETextureFormat.Png, false, out _);
+                var pngOut = EncodeTextureDebug(dec2, tex.Name, "virtualized", fmt2, srcFormatName);
                 return (pngOut, dec2.Width, dec2.Height);
             }
             catch (Exception ex)
@@ -1424,14 +1608,15 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
                 Console.Error.WriteLine($"[tex-ue5] probe @0x{p:X}: {ex.Message}");
             }
         }
+        if (srcPngCompressed) throw new Exception("declared PNG source payload not found at source dimensions");
         // original v1 downstream: decode the assembled bulk payload
         if (assembled != null)
         {
             if (assembled.Length > 8 && assembled[0] == 0x89 && assembled[1] == 0x50 &&
                 assembled[2] == 0x4E && assembled[3] == 0x47)
             {
-                var pngA = ExtractFirstPng(assembled);
-                if (pngA != null) return pngA.Value;
+                var pngA = FindLargestPng(assembled, 0, srcW, srcH);
+                if (pngA != null) return (RestoreSourcePng(pngA.Value.png, srcFormatName, tex.Name, "bulk"), pngA.Value.w, pngA.Value.h);
             }
             var fmtA = InferPixelFormat(srcW, srcH, assembled.Length, srcFormatName);
             var fiA = PixelFormatUtils.PixelFormats.TryGetValue(fmtA, out var fA)
@@ -1456,7 +1641,7 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
                     tex.PlatformData.Mips = new FTexture2DMipMap[] { new(new FByteArrayData(mipA2), wA, hA, 1) };
                     var decA2 = tex.Decode();
                     if (decA2 != null)
-                        return (decA2.Encode(ETextureFormat.Png, false, out _), decA2.Width, decA2.Height);
+                        return (EncodeTextureDebug(decA2, tex.Name, "bulk-low-mip", fmtA, srcFormatName), decA2.Width, decA2.Height);
                 }
             }
             if (assembled.Length < expectedA)
@@ -1466,7 +1651,7 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
             tex.PlatformData.Mips = new FTexture2DMipMap[] { new(new FByteArrayData(mipA), srcW, srcH, 1) };
             var decA = tex.Decode();
             if (decA == null) throw new Exception("texture decode returned null");
-            var pngOutA = decA.Encode(ETextureFormat.Png, false, out _);
+            var pngOutA = EncodeTextureDebug(decA, tex.Name, "bulk", fmtA, srcFormatName);
             return (pngOutA, decA.Width, decA.Height);
         }
         throw new Exception("no mip bulk payload found in file tail");
@@ -1476,8 +1661,8 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
     if (assembled.Length > 8 && assembled[0] == 0x89 && assembled[1] == 0x50 &&
         assembled[2] == 0x4E && assembled[3] == 0x47)
     {
-        var png1 = ExtractFirstPng(assembled);
-        if (png1 != null) return png1.Value;
+        var png1 = FindLargestPng(assembled, 0, srcW, srcH);
+        if (png1 != null) return (RestoreSourcePng(png1.Value.png, srcFormatName, tex.Name, "bulk-final"), png1.Value.w, png1.Value.h);
     }
 
     // otherwise: raw mip data (possibly a full mip chain, mip0 first)
@@ -1500,8 +1685,42 @@ static (byte[] png, int w, int h) ExtractTexturePng(CUE4Parse.UE4.Assets.IPackag
     };
     var decoded = tex.Decode();
     if (decoded == null) throw new Exception("texture decode returned null");
-    var png = decoded.Encode(ETextureFormat.Png, false, out _);
+    var png = EncodeTextureDebug(decoded, tex.Name, "bulk-final", fmt, srcFormatName);
     return (png, decoded.Width, decoded.Height);
+}
+
+// UE FTextureSource PNG compression uses ERGBFormat::RGBA even for TSF_BGRA8.
+// PNG therefore preserves source BGRA byte order; exporting it as ordinary PNG
+// requires one R/B swap. Raw CTexture encoders already honor PixelFormat.
+static byte[] RestoreSourcePng(byte[] png, string sourceFormat, string name, string path) {
+  if (sourceFormat != "TSF_BGRA8") {
+    Console.Error.WriteLine($"[source-png] {name}: path={path}, format={sourceFormat}, action=preserve");
+    return png;
+  }
+  using var codec = SKCodec.Create(new SKMemoryStream(png));
+  if (codec == null) throw new Exception("source PNG codec creation failed");
+  using var bitmap = new SKBitmap(new SKImageInfo(codec.Info.Width, codec.Info.Height,
+      SKColorType.Rgba8888, SKAlphaType.Unpremul));
+  if (codec.GetPixels(bitmap.Info, bitmap.GetPixels()) != SKCodecResult.Success) {
+    throw new Exception("source PNG decode failed");
+  }
+  var data = bitmap.Bytes;
+  var first = BitConverter.ToString(data, 0, Math.Min(16, data.Length));
+  for (int i = 0; i < data.Length; i += 4) {
+    (data[i], data[i + 2]) = (data[i + 2], data[i]);
+  }
+  Marshal.Copy(data, 0, bitmap.GetPixels(), data.Length);
+  using var encoded = bitmap.Encode(SKEncodedImageFormat.Png, 100);
+  Console.Error.WriteLine($"[source-png] {name}: path={path}, format={sourceFormat}, action=restore-bgra, rgbaBefore={first}, rgbaAfter={BitConverter.ToString(data, 0, Math.Min(16, data.Length))}");
+  return encoded.ToArray();
+}
+
+static byte[] EncodeTextureDebug(CTexture decoded, string name, string path,
+                                EPixelFormat inferredFormat, string sourceFormat) {
+  using var bitmap = decoded.ToSkBitmap();
+  var pixel = bitmap.GetPixel(0, 0);
+  Console.Error.WriteLine($"[texture-boundary] {name}: path={path}, source={sourceFormat}, inferred={inferredFormat}, decoded={decoded.PixelFormat}, skia={bitmap.ColorType}, rawFirst={BitConverter.ToString(decoded.Data, 0, Math.Min(16, decoded.Data.Length))}, interpretedRGBA={pixel.Red},{pixel.Green},{pixel.Blue},{pixel.Alpha}");
+  return decoded.Encode(ETextureFormat.Png, false, out _);
 }
 
 // infer the stored pixel format from the assembled mip size + source format
@@ -1522,37 +1741,6 @@ static EPixelFormat InferPixelFormat(int w, int h, int bytes, string sourceForma
         ? EPixelFormat.PF_B8G8R8A8 : EPixelFormat.PF_R8G8B8A8;
 }
 
-// extract the first complete PNG stream (magic..IEND) from a byte range
-static (byte[] png, int w, int h)? ExtractFirstPng(byte[] raw, int from = 0)
-{
-    for (int i = from; i <= raw.Length - 8; i++)
-    {
-        if (raw[i] != 0x89 || raw[i + 1] != 0x50 || raw[i + 2] != 0x4E || raw[i + 3] != 0x47
-            || raw[i + 4] != 0x0D || raw[i + 5] != 0x0A || raw[i + 6] != 0x1A || raw[i + 7] != 0x0A)
-            continue;
-        int w = 0, h = 0;
-        int p = i + 8;
-        bool done = false;
-        while (p + 8 <= raw.Length)
-        {
-            int len = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p));
-            if (len < 0) break;
-            int type = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p + 4));
-            if (type == 0x49484452 && p + 21 <= raw.Length) // IHDR
-            {
-                w = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p + 8));
-                h = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p + 12));
-            }
-            p += 12 + len;
-            if (type == 0x49454E44) { done = true; break; } // IEND
-            if (p > raw.Length) break;
-        }
-        if (done && w > 0)
-            return (raw[i..p], w, h);
-    }
-    return null;
-}
-
 // extract the largest complete PNG stream embedded in the file (mip0 of
 // bPNGCompressed editor textures is stored as a literal PNG)
 static (byte[] png, int w, int h)? FindLargestPng(byte[] raw, int from, int srcW, int srcH)
@@ -1566,21 +1754,23 @@ static (byte[] png, int w, int h)? FindLargestPng(byte[] raw, int from, int srcW
         int w = 0, h = 0;
         int p = i + 8;
         bool done = false;
-        while (p + 8 <= raw.Length)
+        while (p <= raw.Length - 12)
         {
             int len = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p));
-            if (len < 0) break;
+            if (len < 0 || len > raw.Length - p - 12) break;
             int type = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p + 4));
-            if (type == 0x49484452 && p + 21 <= raw.Length) // IHDR
+            if (type == 0x49484452 && len == 13) // IHDR
             {
                 w = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p + 8));
                 h = BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(p + 12));
             }
             p += 12 + len;
-            if (type == 0x49454E44) { done = true; break; } // IEND
+            if (type == 0x49454E44 && len == 0) { done = true; break; } // IEND
             if (p > raw.Length) break;
         }
-        if (done && w > 0 && (best == null || p - i > best.Value.len))
+        if (done && w > 0 && h > 0 && p <= raw.Length
+            && (srcW <= 0 || w == srcW) && (srcH <= 0 || h == srcH)
+            && (best == null || p - i > best.Value.len))
             best = (raw[i..p], w, h, p - i);
     }
     if (best == null) return null;
@@ -1588,7 +1778,7 @@ static (byte[] png, int w, int h)? FindLargestPng(byte[] raw, int from, int srcW
 }
 
 // ---------------------------------------------------------------------------
-// Material binding: categorization + resolution + glTF-convention MR swizzle
+// Material binding: categorization + resolution + source ORM aliases
 // ---------------------------------------------------------------------------
 
 static string Norm(string s) => new(s.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
@@ -1640,63 +1830,99 @@ static SlotBinding? ResolveBinding(MaterialParams? mp, string outDir, string glt
         "metallicroughness", "metallicroughnesstexture", "packedtexture", "packed"));
     if (packed != null)
     {
-        // Channel packing of this pack's <name>_M / ORMH maps (deduced from
-        // T_DumpsterContainer_M channel statistics): R = metallic, G = roughness,
-        // B = AO (A unused). glTF wants G=roughness, B=metallic -> swizzle and
-        // store next to the original as <orig>_MR.png (also usable as
-        // occlusionTexture: R = AO).
-        b.MetallicRoughnessPng = CreateMrSwizzle(packed);
-        b.OcclusionPng = b.MetallicRoughnessPng; // R channel of the swizzled copy = AO
+        // Source M_BaseMaterial's graph routes R to AO, G to roughness and B
+        // to metallic. Preserve these channels; old exports swapped R/B.
+        b.MetallicRoughnessPng = CreateOrmCopy(packed);
+        b.OcclusionPng = b.MetallicRoughnessPng; // Source R channel = AO; this is an identity ORM alias
     }
     foreach (var (k, v) in mp.Scalars)
     {
         var n = Norm(k);
         if (n is "metallic" or "metallicfactor") b.Metallic = v;
         else if (n is "roughness" or "roughnessfactor") b.Roughness = v;
+        else if (n is "opacity") b.Opacity = Math.Clamp(v, 0, 1);
+        else if (n is "basecolor") b.BaseColor = new[] { v, v, v, 1.0 };
+    }
+    foreach (var (name, color) in mp.Vectors) {
+      if (Norm(name) is "basecolor" or "basecolorfactor") {
+        b.BaseColor = color.Select(c => (double)Math.Clamp(c, 0, 1)).ToArray();
+      }
+    }
+    b.AlphaMode = mp.BlendMode switch {
+      "BLEND_Translucent" => "BLEND",
+      "BLEND_Masked" => "MASK",
+      null or "BLEND_Opaque" => "OPAQUE",
+      _ => throw new NotSupportedException($"source blend mode {mp.BlendMode} is not represented by glTF: {mp.Path}")
+    };
+    if (b.AlphaMode == "MASK") {
+      if (mp.MaskTextureParameter == null) {
+        throw new NotSupportedException($"masked source input has no traced profile: {mp.Path}");
+      }
+      // The M_DecalRoad source sample is named BC, not BaseColor.
+      b.BaseColorPng ??= ToPng(FindTextureParam(mp, "bc"));
+      var opacityPng = ToPng(FindTextureParam(mp, mp.MaskTextureParameter));
+      if (b.BaseColorPng == null || opacityPng == null) {
+        throw new Exception($"missing traced masked base/mask texture: {mp.Path}");
+      }
+      b.BaseColorPng = ComposeMaskBaseColor(b.BaseColorPng, opacityPng);
+      b.AlphaCutoff = mp.OpacityMaskClipValue;
+    }
+    b.DoubleSided = mp.DoubleSided;
+    if (mp.UnconnectedMetallicDefault != null) {
+      b.Metallic = mp.UnconnectedMetallicDefault;
     }
     return b;
 }
 
-// swizzle a packed _M/_ORMH png (R=metallic, G=roughness, B=AO) into a
-// glTF-convention metallicRoughness texture (G=roughness, B=metallic, R=AO)
-static string? CreateMrSwizzle(string origPng)
+// Source mask graphs use grayscale RGB as OpacityMask independently of BC.
+// Same UV0 and dimensions allow exact base RGB + mask R packing into glTF alpha.
+static string ComposeMaskBaseColor(string basePng, string maskPng) {
+  string target = Path.Combine(Path.GetDirectoryName(basePng)!,
+      Path.GetFileNameWithoutExtension(basePng) + "__" +
+      Path.GetFileNameWithoutExtension(maskPng) + "_MASK_BASECOLOR.png");
+  if (File.Exists(target)) return target;
+  static SKBitmap DecodeUnpremultiplied(string path) {
+    using var stream = File.OpenRead(path);
+    using var codec = SKCodec.Create(stream);
+    if (codec == null) throw new Exception($"PNG codec failed: {path}");
+    var bitmap = new SKBitmap(new SKImageInfo(codec.Info.Width, codec.Info.Height,
+        SKColorType.Rgba8888, SKAlphaType.Unpremul));
+    if (codec.GetPixels(bitmap.Info, bitmap.GetPixels()) != SKCodecResult.Success) {
+      bitmap.Dispose();
+      throw new Exception($"PNG decode failed: {path}");
+    }
+    return bitmap;
+  }
+  using var color = DecodeUnpremultiplied(basePng);
+  using var mask = DecodeUnpremultiplied(maskPng);
+  if (color.Width != mask.Width || color.Height != mask.Height) {
+    throw new NotSupportedException("traced mask and base dimensions differ; exact packing is unavailable");
+  }
+  var rgba = color.Bytes;
+  var maskRgba = mask.Bytes;
+  for (int i = 0; i < rgba.Length; i += 4) {
+    if (maskRgba[i] != maskRgba[i + 1] || maskRgba[i] != maskRgba[i + 2]) {
+      throw new NotSupportedException("traced RGB opacity sample is not grayscale");
+    }
+    rgba[i + 3] = maskRgba[i];
+  }
+  Marshal.Copy(rgba, 0, color.GetPixels(), rgba.Length);
+  using var encoded = color.Encode(SKEncodedImageFormat.Png, 100);
+  File.WriteAllBytes(target, encoded.ToArray());
+  Console.Error.WriteLine($"[masked-basecolor] base={basePng}; maskR={maskPng}; output={target}; size={color.Width}x{color.Height}");
+  return target;
+}
+
+// Preserve this pack's source ORM channels: R=AO, G=roughness, B=metallic.
+// Keep the historical _MR filename so repaired aliases retain stable paths.
+static string? CreateOrmCopy(string origPng)
 {
     var mrPath = Path.Combine(Path.GetDirectoryName(origPng)!,
         Path.GetFileNameWithoutExtension(origPng) + "_MR.png");
     if (File.Exists(mrPath)) return mrPath;
     try
     {
-        using var src = SKBitmap.Decode(origPng);
-        if (src == null) return null;
-        var sb = src.Bytes;
-        int bpp = src.BytesPerPixel;
-        bool bgra = src.ColorType == SKColorType.Bgra8888;
-        var db = new byte[sb.Length];
-        long pxCount = (long)src.Width * src.Height;
-        for (long i = 0; i < pxCount; i++)
-        {
-            int o = (int)(i * bpp);
-            byte r = bgra ? sb[o + 2] : sb[o + 0];
-            byte g = sb[o + 1];
-            byte bl = bgra ? sb[o + 0] : sb[o + 2];
-            int d = (int)(i * 4); // output is always RGBA8888
-            db[d + 0] = bl;       // R = AO
-            db[d + 1] = g;        // G = roughness
-            db[d + 2] = r;        // B = metallic
-            db[d + 3] = 255;
-        }
-        using var dst = new SKBitmap();
-        var info = new SKImageInfo(src.Width, src.Height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
-        var handle = System.Runtime.InteropServices.GCHandle.Alloc(db, System.Runtime.InteropServices.GCHandleType.Pinned);
-        try
-        {
-            dst.InstallPixels(info, handle.AddrOfPinnedObject());
-            using var img = SKImage.FromBitmap(dst);
-            using var data = img.Encode(SKEncodedImageFormat.Png, 100);
-            using var pngFs = File.Create(mrPath);
-            data.SaveTo(pngFs);
-        }
-        finally { handle.Free(); }
+        File.Copy(origPng, mrPath);
         return mrPath;
     }
     catch (Exception)
@@ -1721,6 +1947,15 @@ static void WriteMaterialsJson(string path, List<(string MeshName, string PkgPat
         w.WriteString("path", mp.Path);
         w.WriteString("name", mp.Name);
         if (mp.ParentPath != null) w.WriteString("parent", mp.ParentPath);
+        if (mp.BlendMode != null) w.WriteString("sourceBlendMode", mp.BlendMode);
+        w.WriteBoolean("sourceDoubleSided", mp.DoubleSided);
+        if (mp.MaskTextureParameter != null) {
+          w.WriteString("sourceOpacityMaskParameter", mp.MaskTextureParameter);
+          w.WriteNumber("sourceOpacityMaskClipValue", mp.OpacityMaskClipValue);
+        }
+        if (mp.UnconnectedMetallicDefault != null) {
+          w.WriteNumber("unconnectedSourceMetallicDefault", mp.UnconnectedMetallicDefault.Value);
+        }
         w.WriteStartObject("textureParameters");
         foreach (var (k, v) in mp.Textures) w.WriteString(k, v);
         w.WriteEndObject();
@@ -1771,6 +2006,130 @@ static void WriteMaterialsJson(string path, List<(string MeshName, string PkgPat
 // Minimal glTF 2.0 writer
 // ---------------------------------------------------------------------------
 
+static float[] NormalizeNormals(float[] positions, float[] normals, uint[] indices) {
+  int vertexCount = positions.Length / 3;
+  if (normals.Length != positions.Length) {
+    throw new Exception("normal count differs from position count");
+  }
+  var result = (float[])normals.Clone();
+  var accumulated = new double[positions.Length];
+  for (int t = 0; t < indices.Length; t += 3) {
+    int a = checked((int)indices[t]) * 3;
+    int b = checked((int)indices[t + 1]) * 3;
+    int c = checked((int)indices[t + 2]) * 3;
+    double ux = positions[b] - positions[a];
+    double uy = positions[b + 1] - positions[a + 1];
+    double uz = positions[b + 2] - positions[a + 2];
+    double vx = positions[c] - positions[a];
+    double vy = positions[c + 1] - positions[a + 1];
+    double vz = positions[c + 2] - positions[a + 2];
+    double nx = uy * vz - uz * vy;
+    double ny = uz * vx - ux * vz;
+    double nz = ux * vy - uy * vx;
+    foreach (int corner in new[] { a, b, c }) {
+      accumulated[corner] += nx;
+      accumulated[corner + 1] += ny;
+      accumulated[corner + 2] += nz;
+    }
+  }
+  int reconstructed = 0;
+  int degenerate = 0;
+  for (int i = 0; i < vertexCount; i++) {
+    int o = i * 3;
+    double x = result[o];
+    double y = result[o + 1];
+    double z = result[o + 2];
+    double length = Math.Sqrt(x * x + y * y + z * z);
+    if (!double.IsFinite(length) || length < 1e-12) {
+      x = accumulated[o];
+      y = accumulated[o + 1];
+      z = accumulated[o + 2];
+      length = Math.Sqrt(x * x + y * y + z * z);
+      reconstructed++;
+    }
+    if (!double.IsFinite(length) || length < 1e-12) {
+      // An unused vertex or zero-area face has no geometric normal.
+      x = 0;
+      y = 0;
+      z = 1;
+      length = 1;
+      degenerate++;
+    }
+    result[o] = (float)(x / length);
+    result[o + 1] = (float)(y / length);
+    result[o + 2] = (float)(z / length);
+  }
+  if (reconstructed > 0) {
+    Console.Error.WriteLine($"[normals] reconstructed={reconstructed}, degenerate={degenerate}");
+  }
+  return result;
+}
+
+static (float[] Positions, float[] Uvs, float[] Normals, uint[] Indices, int Faces, int Copies)
+    CorrectOpposedCornerNormals(float[] positions, float[] uvs, float[] normals,
+                               uint[] indices) {
+  var references = new int[positions.Length / 3];
+  foreach (uint index in indices) {
+    references[index]++;
+  }
+  var targets = new List<int>();
+  for (int t = 0; t < indices.Length; t += 3) {
+    int a = (int)indices[t] * 3;
+    int b = (int)indices[t + 1] * 3;
+    int c = (int)indices[t + 2] * 3;
+    double ux = positions[b] - positions[a];
+    double uy = positions[b + 1] - positions[a + 1];
+    double uz = positions[b + 2] - positions[a + 2];
+    double vx = positions[c] - positions[a];
+    double vy = positions[c + 1] - positions[a + 1];
+    double vz = positions[c + 2] - positions[a + 2];
+    double nx = uy * vz - uz * vy;
+    double ny = uz * vx - ux * vz;
+    double nz = ux * vy - uy * vx;
+    double area = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+    if (area < 1e-8) {
+      continue;
+    }
+    bool allOpposed = true;
+    for (int corner = 0; corner < 3; corner++) {
+      int o = (int)indices[t + corner] * 3;
+      double dot = nx * normals[o] + ny * normals[o + 1] + nz * normals[o + 2];
+      allOpposed &= dot < -area * 1e-6;
+    }
+    if (allOpposed) {
+      targets.Add(t);
+    }
+  }
+  if (targets.Count == 0) {
+    return (positions, uvs, normals, indices, 0, 0);
+  }
+  var correctedPositions = positions.ToList();
+  var correctedUvs = uvs.ToList();
+  var correctedNormals = normals.ToList();
+  int copies = 0;
+  foreach (int t in targets) {
+    for (int corner = 0; corner < 3; corner++) {
+      int source = (int)indices[t + corner];
+      int target = source;
+      if (references[source] > 1) {
+        target = correctedPositions.Count / 3;
+        correctedPositions.AddRange(positions.AsSpan(source * 3, 3).ToArray());
+        correctedUvs.AddRange(uvs.AsSpan(source * 2, 2).ToArray());
+        correctedNormals.AddRange(normals.AsSpan(source * 3, 3).ToArray());
+        indices[t + corner] = (uint)target;
+        copies++;
+      }
+      // Reverse only this face's authored corner-normal direction, retaining
+      // its smoothing angle. Geometry and UVs are unchanged.
+      for (int axis = 0; axis < 3; axis++) {
+        correctedNormals[target * 3 + axis] = -normals[source * 3 + axis];
+      }
+    }
+  }
+  return (correctedPositions.ToArray(), correctedUvs.ToArray(), correctedNormals.ToArray(),
+          indices, targets.Count, copies);
+}
+
 static void WriteGltf(string outPath, string meshName, float[] positions, float[] uvs,
     float[] normals, uint[] indices, string[] slotNames, int[] cornerSlots, SlotBinding?[] bindings)
 {
@@ -1778,12 +2137,39 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
     var binPath = Path.ChangeExtension(outPath, ".bin");
     var gltfDir = Path.GetDirectoryName(outPath)!;
 
-    // split primitives per material slot
+    if (indices.Length % 3 != 0 || cornerSlots.Length != indices.Length ||
+        positions.Length / 3 != uvs.Length / 2 ||
+        indices.Any(index => index >= positions.Length / 3)) {
+      throw new Exception("invalid geometry streams");
+    }
+    // UE source faces use clockwise order. glTF requires counterclockwise
+    // exterior faces; the root rotation and positive scale do not change parity.
+    indices = (uint[])indices.Clone();
+    for (int t = 0; t < indices.Length; t += 3) {
+      (indices[t + 1], indices[t + 2]) = (indices[t + 2], indices[t + 1]);
+    }
+    normals = NormalizeNormals(positions, normals, indices);
+    var cornerRepair = CorrectOpposedCornerNormals(positions, uvs, normals, indices);
+    positions = cornerRepair.Positions;
+    uvs = cornerRepair.Uvs;
+    normals = cornerRepair.Normals;
+    indices = cornerRepair.Indices;
+    if (cornerRepair.Faces > 0) {
+      Console.Error.WriteLine($"[normals-corner] {meshName}: faces={cornerRepair.Faces}, copiedCorners={cornerRepair.Copies}");
+    }
+    // Preserve each source triangle exactly once in its polygon group's slot.
     int numSlots = Math.Max(1, slotNames.Length);
     var perSlot = new List<uint>[numSlots];
     for (int i = 0; i < numSlots; i++) perSlot[i] = new List<uint>();
-    for (int t = 0; t < indices.Length; t++)
-        perSlot[Math.Min(cornerSlots[t], numSlots - 1)].Add(indices[t]);
+    for (int t = 0; t < indices.Length; t += 3) {
+      int slot = cornerSlots[t];
+      if (slot < 0 || slot >= numSlots || cornerSlots[t + 1] != slot ||
+          cornerSlots[t + 2] != slot) {
+        throw new Exception($"invalid polygon material group at triangle {t / 3}");
+      }
+      perSlot[slot].AddRange(indices.AsSpan(t, 3).ToArray());
+    }
+    var usedSlots = Enumerable.Range(0, numSlots).Where(i => perSlot[i].Count > 0).ToArray();
 
     using var bin = new MemoryStream();
     var views = new List<(int offset, int length, int target)>();
@@ -1807,14 +2193,17 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
     Buffer.BlockCopy(uvs, 0, uvBytes, 0, uvBytes.Length);
     Append(uvBytes, 34962);
 
-    var idxBytes = new byte[indices.Length * 4];
-    for (int i = 0; i < indices.Length; i++)
-        BinaryPrimitives.WriteUInt32LittleEndian(idxBytes.AsSpan(i * 4), indices[i]);
-    Append(idxBytes, 34963);
+    foreach (int slot in usedSlots) {
+      var idxBytes = new byte[perSlot[slot].Count * 4];
+      for (int i = 0; i < perSlot[slot].Count; i++) {
+        BinaryPrimitives.WriteUInt32LittleEndian(idxBytes.AsSpan(i * 4), perSlot[slot][i]);
+      }
+      Append(idxBytes, 34963);
+    }
 
     File.WriteAllBytes(binPath, bin.ToArray());
 
-    var posView = views[0]; var nrmView = views[1]; var uvView = views[2]; var idxView = views[3];
+    var posView = views[0]; var nrmView = views[1]; var uvView = views[2];
 
     // ---- texture/image/sampler tables from the per-slot bindings ----
     // One texture per image; texture index == image index == position in both lists.
@@ -1831,8 +2220,10 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
 
     var slotTex = new List<(int? baseColor, int? normal, int? emissive, int? mr, int? occl)>();
     var slotFactors = new List<(double? metallic, double? roughness)>();
-    foreach (var bnd in bindings)
+    for (int sourceSlot = 0; sourceSlot < numSlots; sourceSlot++)
     {
+        var bnd = sourceSlot < bindings.Length && perSlot[sourceSlot].Count > 0 ?
+            bindings[sourceSlot] : null;
         int bc = -1, nm = -1, em = -1, mr = -1, oc = -1;
         if (bnd != null)
         {
@@ -1853,10 +2244,16 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
     w.WriteStartObject();
     w.WriteStartObject("asset");
     w.WriteString("version", "2.0");
-    w.WriteString("generator", "CityExporter v2 (UE uncooked editor packages; root node: -90deg X rotation + 0.01 scale -> Y-up meters)");
+    w.WriteString("generator", "CityExporter repair v13 / 20261005 (Y-up meters)");
     w.WriteEndObject();
 
-    w.WriteStartArray("scene"); w.WriteNumberValue(0); w.WriteEndArray();
+    w.WriteNumber("scene", 0);
+    w.WriteStartObject("extras");
+    w.WriteNumber("sourceMaterialSlotCount", numSlots);
+    w.WriteNumber("sourceTriangleCount", indices.Length / 3);
+    w.WriteNumber("correctedCornerNormalFaces", cornerRepair.Faces);
+    w.WriteNumber("copiedSharedCorners", cornerRepair.Copies);
+    w.WriteEndObject();
     w.WriteStartArray("scenes");
     w.WriteStartObject();
     w.WriteStartArray("nodes"); w.WriteNumberValue(0); w.WriteEndArray();
@@ -1883,7 +2280,7 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
     w.WriteEndArray();
 
     w.WriteStartArray("materials");
-    for (int i = 0; i < numSlots; i++)
+    foreach (int i in usedSlots)
     {
         w.WriteStartObject();
         w.WriteString("name", i < slotNames.Length && slotNames[i].Length > 0 ? slotNames[i] : $"Material{i}");
@@ -1906,6 +2303,32 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
         }
         w.WriteNumber("metallicFactor", metallic ?? 1.0);
         w.WriteNumber("roughnessFactor", roughness ?? 1.0);
+        var binding = i < bindings.Length ? bindings[i] : null;
+        if (binding?.BaseColor != null || binding?.AlphaMode is "BLEND" or "MASK") {
+          var color = binding.BaseColor ?? new[] { 1.0, 1.0, 1.0, 1.0 };
+          w.WriteStartArray("baseColorFactor");
+          w.WriteNumberValue(color[0]);
+          w.WriteNumberValue(color[1]);
+          w.WriteNumberValue(color[2]);
+          w.WriteNumberValue(binding.AlphaMode == "MASK" ? 1.0
+              : binding.AlphaMode == "BLEND" ? binding.Opacity ?? color[3] : color[3]);
+          w.WriteEndArray();
+        }
+        w.WriteEndObject();
+        if (binding?.AlphaMode is "BLEND" or "MASK") {
+          w.WriteString("alphaMode", binding.AlphaMode);
+          if (binding.AlphaMode == "MASK") {
+            w.WriteNumber("alphaCutoff", binding.AlphaCutoff!.Value);
+          }
+        }
+        if (binding?.DoubleSided == true) {
+          w.WriteBoolean("doubleSided", true);
+        }
+        w.WriteStartObject("extras");
+        w.WriteNumber("sourceMaterialSlot", i);
+        if (binding != null) {
+          w.WriteString("sourceMaterialPath", binding.MaterialPath);
+        }
         w.WriteEndObject();
         if (nm != null)
         {
@@ -1939,17 +2362,20 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
     w.WriteStartObject();
     w.WriteString("name", meshName);
     w.WriteStartArray("primitives");
-    for (int i = 0; i < numSlots; i++)
+    for (int materialIndex = 0; materialIndex < usedSlots.Length; materialIndex++)
     {
-        if (perSlot[i].Count == 0) continue;
+        int i = usedSlots[materialIndex];
         w.WriteStartObject();
         w.WriteStartObject("attributes");
         w.WriteNumber("POSITION", 0);
         w.WriteNumber("NORMAL", 1);
         w.WriteNumber("TEXCOORD_0", 2);
         w.WriteEndObject();
-        w.WriteNumber("indices", 3);
-        w.WriteNumber("material", i);
+        w.WriteNumber("indices", 3 + materialIndex);
+        w.WriteNumber("material", materialIndex);
+        w.WriteStartObject("extras");
+        w.WriteNumber("sourceMaterialSlot", i);
+        w.WriteEndObject();
         w.WriteEndObject();
     }
     w.WriteEndArray();
@@ -1960,7 +2386,9 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
     WriteNumAccessor(w, 0, posView, positions.Length / 3, "VEC3", 5126, positions);
     WriteNumAccessor(w, 1, nrmView, normals.Length / 3, "VEC3", 5126, normals);
     WriteNumAccessor(w, 2, uvView, uvs.Length / 2, "VEC2", 5126, uvs);
-    WriteIndexAccessor(w, 3, idxView, indices.Length);
+    for (int i = 0; i < usedSlots.Length; i++) {
+      WriteIndexAccessor(w, 3 + i, views[3 + i], perSlot[usedSlots[i]].Count);
+    }
     w.WriteEndArray();
 
     if (texOfImage.Count > 0)
@@ -1976,8 +2404,11 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
         w.WriteEndArray();
 
         w.WriteStartArray("images");
-        foreach (var uri in images)
-            w.WriteStringValue(uri);
+        foreach (var uri in images) {
+          w.WriteStartObject();
+          w.WriteString("uri", uri);
+          w.WriteEndObject();
+        }
         w.WriteEndArray();
 
         w.WriteStartArray("samplers");
@@ -1991,7 +2422,9 @@ static void WriteGltf(string outPath, string meshName, float[] positions, float[
     }
 
     w.WriteStartArray("bufferViews");
-    WriteView(w, 0, posView); WriteView(w, 1, nrmView); WriteView(w, 2, uvView); WriteView(w, 3, idxView);
+    for (int i = 0; i < views.Count; i++) {
+      WriteView(w, i, views[i]);
+    }
     w.WriteEndArray();
 
     w.WriteStartArray("buffers");
@@ -2114,6 +2547,11 @@ class MaterialParams
     public string Path = "";       // /Game/... package path (without extension)
     public string Name = "";
     public string? ParentPath;     // /Game/... of the master material
+    public string? BlendMode;
+    public bool DoubleSided;
+    public double? UnconnectedMetallicDefault;
+    public string? MaskTextureParameter;
+    public double OpacityMaskClipValue = 0.3333f;
     public Dictionary<string, string> Textures = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, double> Scalars = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, float[]> Vectors = new(StringComparer.OrdinalIgnoreCase);
@@ -2130,6 +2568,11 @@ class SlotBinding
     public string? OcclusionPng;
     public double? Metallic;
     public double? Roughness;
+    public double? Opacity;
+    public double[]? BaseColor;
+    public string AlphaMode = "OPAQUE";
+    public double? AlphaCutoff;
+    public bool DoubleSided;
     public string? BaseColorUri, NormalUri, EmissiveUri, MetallicRoughnessUri, OcclusionUri;
 }
 
@@ -2190,4 +2633,3 @@ class Ue5Attr
     public int ElemCount; // per channel element count
     public override string ToString() => $"{Name}: t={TypeIdx} ext={Extent} ch={Channels.Count} n={ElemCount}";
 }
-

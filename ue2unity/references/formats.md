@@ -20,7 +20,7 @@
 
 纹理导出属性含 Source 结构（SizeX/SizeY/Format 从属性 blob 裸字节取）。
 载荷两种形态：
-- `bPNGCompressed`：整张 PNG 内嵌在文件里 → 扫 PNG 魔数直接抠
+- `bPNGCompressed`：读取真实Source PNG（内嵌或解压bulk），有界chunk/IEND并匹配Source尺寸；另做完整PNG CRC/解码验证，扫描器本身不检查CRC。BGRA8内部PNG恢复R/B；G8和已格式感知raw不重复交换。不能仅扫描魔数选最大图。
 - 原始 BC 块：FByteBulkData（分块 zlib）→ 解出后按
   `blocksX×blocksY×BlockBytes` 推断像素格式再解码
 
@@ -102,8 +102,8 @@ zlib 流序列（每块一个，紧排到文件尾）
 
 ## 5. 降分辨率恢复
 
-"assembled N < expected M" 的贴图：手里是低 mip（N≈M/4 → 半分辨率）。
-按 scale=1,2,4,8 找 `expected/scale² ≤ N`，用 `w/scale × h/scale` 解码。
+仅在已证明为非PNG的有效raw mip路径按实际mip尺寸解码并报告降分辨率。
+Source声明bPNGCompressed时必须恢复完整Source尺寸；低mip/猜raw不是该声明的合法fallback。
 
 ## 布局陷阱汇总
 
@@ -119,13 +119,13 @@ zlib 流序列（每块一个，紧排到文件尾）
 
 ## 6. 旧格式多边形元素布局（修正版，重要）
 
-每个多边形元素恰好 **2 个 int：{ PolygonGroupID, 0 }**——周长数组**不序列化**
-（勿按 FMeshPolygon_Legacy 源码读变长 TArray，会把非零组 ID 的网格全部带偏）。
+本案例实测每个多边形元素 **2个int：{empty perimeter count=0, PolygonGroupID}**。
+第一个int是空周长数组计数，第二个才是组号；反读会丢掉多材质分组。遇到非零perimeter count需要真实变长解析，不能仍固定消耗两个int。
 
 三角形拓扑 = 实例按创建顺序三连（导入器行为）。**焊接网格不变量**：
-`numVI == 3 × numPolys` 必须成立；不成立 = 文件里根本没有面连接数据
+本案例可使用三连实例fallback时要求 `numVI == 3 × numPolys`；不成立时应检查真实拓扑属性与面连接数据，不能据此单独判断源损坏
 （实证：SM_fence_03 的 96 个多边形元素全零，只有 88 顶点/180 边/192 实例，
-无三角形属性记录——源包残缺，UE 编辑器同样无法渲染）。
+无三角形属性记录——当前路径无法恢复拓扑；未做源UE运行验证，不能声称UE编辑器也无法渲染）。
 
 ## 7. 关键正确性陷阱：position 按顶点存、索引引用实例
 
