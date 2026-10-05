@@ -116,3 +116,20 @@ zlib 流序列（每块一个，紧排到文件尾）
 | libarchive RAR5 | 解码器缺陷，禁止用于 RAR 解压 |
 | 材质参数名 | UE4.25 在 `ParameterInfo.Index`（不是 .Name） |
 | MI 跨包引用 | `FPackageIndex.Load()` 返回无属性占位对象，需 provider 完整加载包 |
+
+## 6. 旧格式多边形元素布局（修正版，重要）
+
+每个多边形元素恰好 **2 个 int：{ PolygonGroupID, 0 }**——周长数组**不序列化**
+（勿按 FMeshPolygon_Legacy 源码读变长 TArray，会把非零组 ID 的网格全部带偏）。
+
+三角形拓扑 = 实例按创建顺序三连（导入器行为）。**焊接网格不变量**：
+`numVI == 3 × numPolys` 必须成立；不成立 = 文件里根本没有面连接数据
+（实证：SM_fence_03 的 96 个多边形元素全零，只有 88 顶点/180 边/192 实例，
+无三角形属性记录——源包残缺，UE 编辑器同样无法渲染）。
+
+## 7. 关键正确性陷阱：position 按顶点存、索引引用实例
+
+旧格式 Position 属性是**顶点键**（count == numVerts），而 TextureCoordinate/Normal
+是**实例键**（count == numVI）。索引引用实例 → **必须用 viToVertex 把 position
+展开到实例维**，否则焊接网格产生越界索引的非法 glTF（症状：max(index) ≥
+POSITION accessor count）。全量交付前务必跑索引一致性抽检。

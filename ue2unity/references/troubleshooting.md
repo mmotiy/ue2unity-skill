@@ -77,3 +77,13 @@ libarchive（tar.exe）的 RAR5 缺陷。改用 7-Zip（系统安装版或 PeaZi
 - 法线凹凸相反 → 对应 `_N.png` 翻绿通道（大概率不需要）
 - `_M/_MR/_Mask` 类贴图必须线性空间（Editor 脚本已自动处理）
 - 拖 .gltf 进场景即可，材质已挂；prefab 从 Project 视图直接拖
+
+## 补充（v7 实战）
+
+### 全量导出后约一半网格 max(index) ≥ POSITION count
+旧格式 position 顶点键 vs 索引实例键错位。修法：viToVertex 展开位置数组。
+交付前必检：遍历全部 glTF 验证 `max(indices) < POSITION count`。
+
+### `non-triangle topology (VI=N, polys=M): no face connectivity in source`
+源文件无面连接数据（多边形元素全零 + 无三角形属性）。不可转换，记录放弃。
+判定特征：numVI != 3×numPolys 且多边形元素区全零。

@@ -969,10 +969,13 @@ static (float[] pos, float[] uv, float[] nrm, uint[] idx, string[] slots, int[] 
 
     int numPolys = NumElements();
     var polyGroup = new int[numPolys];
+    // dump-verified on this pack: each polygon element is exactly 2 ints
+    // { PolygonGroupID, 0 } — perimeters are NOT serialized (the 4 meshes that
+    // would need them carry no face connectivity at all, see error class below)
     for (int p = 0; p < numPolys; p++)
     {
-        polyGroup[p] = r.I32(); // polygon group id
-        r.I32();                // second int (unused/flags)
+        polyGroup[p] = r.I32();
+        r.I32();
     }
 
     int numGroups = NumElements();
@@ -1043,11 +1046,30 @@ static (float[] pos, float[] uv, float[] nrm, uint[] idx, string[] slots, int[] 
     }
 
     if (position == null) throw new Exception("no Position attribute");
-    if (numVI % 3 != 0 || numVI / 3 != numPolys)
-        throw new Exception($"non-triangle polygons (VI={numVI}, polys={numPolys}) not supported");
     if (texCoord == null) texCoord = new float[numVI * 2]; // no UVs: zeros
 
-    // corners are ordered by construction: corner c -> vertex instance c
+    // expand per-vertex positions to per-instance (indices reference instances)
+    if (position.Length == numVerts * 3 && numVI > 0)
+    {
+        var posVI = new float[numVI * 3];
+        for (int vi = 0; vi < numVI; vi++)
+        {
+            int v = viToVertex[vi];
+            if (v >= 0 && v < numVerts)
+            {
+                posVI[vi * 3] = position[v * 3];
+                posVI[vi * 3 + 1] = position[v * 3 + 1];
+                posVI[vi * 3 + 2] = position[v * 3 + 2];
+            }
+        }
+        position = posVI;
+    }
+
+    // triangles = consecutive instance triples (instances are created in corner
+    // order on import); welded meshes without this 3:1 invariant carry no face
+    // connectivity in the file at all and are unconvertible
+    if (numVI != numPolys * 3)
+        throw new Exception($"non-triangle topology (VI={numVI}, polys={numPolys}): no face connectivity in source");
     var indices = new uint[numVI];
     var cornerSlots = new int[numVI];
     for (int p = 0; p < numPolys; p++)
